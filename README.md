@@ -1,0 +1,2 @@
+# SearchGoogle
+一个可以寻找google可用ip的应用，对于在GWF内生存的人们来说非常实用。并且这个是用go语言写的哦
