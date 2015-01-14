@@ -1,66 +1,162 @@
+//批量获取搜狐股票成交明细数据。
 package main
 
 import (
+	"bufio"
 	"container/list"
 	"encoding/csv"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
-var outputFileName string = "filesName.csv"
-var timeout = time.Duration(2 * time.Second)
+//var startDate *string = flag.String("d", "Null", "please input a startDate like 20131104")
+var num *int = flag.Int("n", 0, "please input a num like 1024")
 var ips = list.New()
+var outputFileName string = "resutl.csv"
 
-//超时时间
+func main() {
+	flag.Usage = show_usage
+	flag.Parse()
+	var (
+		stockCodeFile string
+		logFileDir    string
+		downDir       string
+		downFileExt   string
+		getUrl        string
+	)
+
+	if *num == 0 {
+		show_usage()
+		return
+	}
+
+	cupNum := runtime.NumCPU()
+	runtime.GOMAXPROCS(cupNum) //设置cpu的核的数量，从而实现高并发
+	c := make(chan int, *num)
+
+	stockCodeFile = "./ips/173.194.0.0_16"
+
+	//日志文件目录，文件下载地址，下载后保存的文件类型
+
+	logFileDir = "./log/" + time.Now().Format("2006-01-02") + "/"
+	downDir = "./data/" + time.Now().Format("2006-01-02") + "/"
+	downFileExt = ".text"
+
+	if !isDirExists(logFileDir) { //目录不存在，则进行创建。
+		err := os.MkdirAll(logFileDir, 777) //递归创建目录，linux下面还要考虑目录的权限设置。
+		if err != nil {
+			panic(err)
+		}
+	}
+	if !isDirExists(downDir) { //目录不存在，则进行创建。
+		err := os.MkdirAll(downDir, 777) //递归创建目录，linux下面还要考虑目录的权限设置。
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	logfile, _ := os.OpenFile(logFileDir+time.Now().Format("2006-01-02")+".log", os.O_RDWR|os.O_CREATE, 0)
+	logger := log.New(logfile, "\r\n", log.Ldate|log.Ltime|log.Llongfile)
+
+	fh, ferr := os.Open(stockCodeFile)
+	if ferr != nil {
+		return
+	}
+	defer fh.Close()
+	inputread := bufio.NewReader(fh)
+
+	for i := 1; i <= *num; i++ { //加入goroutine缓冲，4个执行完了再执行下面的4个
+		input, _ := inputread.ReadString('\n')
+		code := strings.TrimSpace(input)
+
+		getUrl = code
+		fmt.Println(getUrl)
+		go func(logger *log.Logger, logfile *os.File, code string, downDir string, getUrl string, downFileExt string) {
+			testConnection(logger, logfile, code, downDir, getUrl, downFileExt)
+			c <- 0
+		}(logger, logfile, code, downDir, getUrl, downFileExt)
+
+		if i%4 == 0 { //并发默认为4
+			time.Sleep(4 * time.Second) //加入执行缓冲，否则同时发起大量的tcp连接，操作系统会直接返回错误。
+		}
+
+	}
+	defer logfile.Close()
+	for j := 0; j < *num; j++ {
+		<-c
+	}
+	files := ConvertToSlice(ips)
+	fmt.Println("符合条数的一共有" + strconv.Itoa(len(files)) + "条")
+
+	GoOutputFiles(ips, downDir)
+
+}
+
+var timeout = time.Duration(2 * time.Second)
+
 func dialTimeout(network, addr string) (net.Conn, error) {
 	return net.DialTimeout(network, addr, timeout)
 }
+func testConnection(logger *log.Logger, logfile *os.File, code string, downDir string, getUrl string, downFileExt string) {
 
-//var c = make(chan string, 100)
+	transport := http.Transport{
+		Dial: dialTimeout,
+	}
 
-/**获得目录的绝对路径****/
-func GetFullPath(path string) string {
-	absolutePath, _ := filepath.Abs(path)
-	fmt.Println("文件的绝对路径是" + absolutePath)
-	return absolutePath
+	client := http.Client{
+		Transport: &transport,
+	}
+	resp, err := client.Get("http://" + code)
+	if err == nil {
+		fmt.Println(resp.StatusCode)
+		if resp.StatusCode == 200 {
+			fmt.Println(code)
+			ips.PushBack(code)
+			logger.Println(logfile, code+":http get StatusCode"+strconv.Itoa(resp.StatusCode))
+		} else {
+			fmt.Println("两秒钟之内没有连接成功")
+			logger.Println(logfile, code+":http get StatusCode"+strconv.Itoa(resp.StatusCode))
+		}
+
+	} else {
+
+		logger.Println(code + " can do nothing becacuse I can not connect the internet")
+	}
 }
 
-/***获得该目录下的所有文件名*****/
-func PrintFilesName(path string) []string {
-	fullPath := GetFullPath(path)
+func isDirExists(path string) bool {
+	fi, err := os.Stat(path)
 
-	listStr := list.New()
-
-	filepath.Walk(fullPath, func(path string, fi os.FileInfo, err error) error {
-		if nil == fi {
-			return err
-		}
-		if fi.IsDir() {
-			return nil
-		}
-		name := fi.Name()
-
-		if outputFileName != name {
-			listStr.PushBack(name)
-		}
-
-		return nil
-	})
-	return ConvertToSlice(listStr)
+	if err != nil {
+		return os.IsExist(err)
+	} else {
+		return fi.IsDir()
+	}
 }
 
-/**文件写入*/
-func OutputFilesName(listStr *list.List) {
+func show_usage() {
+	fmt.Fprintf(os.Stderr,
+		"Usage: %s [-n=<num>]\n"+
+			"       <command> [<args>]\n\n",
+		os.Args[0])
+	fmt.Fprintf(os.Stderr,
+		"Flags:\n")
+	flag.PrintDefaults()
+
+}
+func GoOutputFiles(listStr *list.List, downDir string) {
 	files := ConvertToSlice(listStr)
 	//sort.StringSlice(files).Sort()// sort
 
-	f, err := os.Create(outputFileName)
+	f, err := os.Create(downDir + outputFileName)
 	//f, err := os.OpenFile(outputFileName, os.O_APPEND | os.O_CREATE, os.ModeAppend)
 	CheckErr(err)
 	defer f.Close()
@@ -75,11 +171,6 @@ func OutputFilesName(listStr *list.List) {
 
 	writer.Flush()
 }
-func CheckErr(err error) {
-	if nil != err {
-		panic(err)
-	}
-}
 
 /*******把list转为数组**********/
 func ConvertToSlice(listStr *list.List) []string {
@@ -91,67 +182,8 @@ func ConvertToSlice(listStr *list.List) []string {
 	return sli
 }
 
-/***
-**读取文件
-***/
-func readFile(path string) string {
-	fi, err := os.Open(path)
-	if err != nil {
+func CheckErr(err error) {
+	if nil != err {
 		panic(err)
 	}
-	defer fi.Close()
-	fd, err := ioutil.ReadAll(fi)
-	// fmt.Println(string(fd))
-	return string(fd)
-}
-func testConnection(ip string, channels chan int) {
-
-	transport := http.Transport{
-		Dial: dialTimeout,
-	}
-
-	client := http.Client{
-		Transport: &transport,
-	}
-	resp, err := client.Get("http://" + ip)
-	if err == nil {
-		fmt.Println(resp.StatusCode)
-		if resp.StatusCode == 200 {
-			fmt.Println(ip)
-			ips.PushBack(ip)
-		}
-
-	}
-	<-channels
-}
-
-func main() {
-	//获得文件的绝对位置
-	var c = make(chan int, 10)
-
-	var files []string = PrintFilesName("ips")
-	var path = GetFullPath("ips")
-	for i := 0; i < len(files); i++ {
-		if i < 1 {
-			var fileFullPath = path + "\\" + files[i]
-			contentFile := readFile(fileFullPath)
-			var result = strings.Split(contentFile, "\n")
-			fmt.Println(len(result))
-			for j, value := range result {
-				if j < 100 {
-					c <- 1
-					go testConnection(value, c)
-
-				} else {
-					break
-				}
-			}
-		} else {
-			break
-		}
-		//打开文件
-	}
-
-	OutputFilesName(ips)
-	fmt.Println("done!")
 }
